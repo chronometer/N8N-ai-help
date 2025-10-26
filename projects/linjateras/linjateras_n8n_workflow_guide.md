@@ -2,7 +2,7 @@
 
 ## Executive Summary
 
-This guide provides a complete implementation blueprint for creating an intelligent n8n workflow system to analyze painting RFPs, extract technical requirements from drawings, calculate quotes, and generate professional proposals for Linjateras Oy, Finland's leading powder coating specialist.
+This guide provides a complete implementation blueprint for creating an intelligent n8n workflow using **AI Agent nodes, OpenRouter integration, and n8n tools** to analyze painting RFPs, extract technical requirements from drawings, calculate quotes, and generate professional proposals for Linjateras Oy, Finland's leading powder coating specialist.
 
 **Critical note**: Linjateras exclusively provides powder coating services, not wet painting, with specific equipment constraints that must be validated for every quote.
 
@@ -38,60 +38,74 @@ This guide provides a complete implementation blueprint for creating an intellig
 
 ---
 
-## 2. n8n Workflow Architecture
+## 2. n8n AI Agent Workflow Architecture
 
 ### Overall Workflow Structure
 
 ```
 START (RFP Document Upload)
     ↓
-[Guardrail: Input Validation]
+[n8n Form Trigger / Webhook]
     ↓
-[HTTP Request: OpenAI API - Extract Requirements]
+[Edit Fields: Prepare Input Data]
     ↓
-[IF/ELSE: Has Technical Drawings?]
-    ├─ YES → [HTTP Request: OpenAI Vision - Analyze Drawing]
-    │         ↓
-    │    [Code: Parse Dimensions]
-    │         ↓
-    │    [Code: Calculate Surface Area]
-    │         ↓
-    └─ NO  → [Manual Input Wait: Flag for clarification]
-              ↓
-[Code: Validate Dimensions vs Equipment Limits]
+[AI Agent: RFP Requirements Extractor]
+  Tools: Code Interpreter, File Search
     ↓
-[IF/ELSE: Within Constraints?]
-    ├─ NO  → [End: Send Rejection]
+[Switch: Document Type & Drawings Available?]
+    ├─ Has Drawings → [AI Agent: Technical Drawing Analyzer]
+    │                   Tools: Code Interpreter, Vision
+    │                     ↓
+    │                [Code: Validate Surface Calculations]
+    │                     ↓
+    ├─ No Drawings  → [Edit Fields: Flag Manual Review]
+    │                     ↓
+    └─ Invalid Doc  → [Send Email: Request Clarification]
+                          ↓
+[AI Agent: Dimensional Validator & Feasibility]
+  Tools: Code Interpreter
+    ↓
+[IF: Within Equipment Constraints?]
+    ├─ NO  → [AI Agent: Generate Rejection Letter]
+    │          ↓
+    │       [Send Email: Rejection]
+    │          ↓
+    │       [END]
     └─ YES → Continue
               ↓
-[HTTP Request: OpenAI - Calculate Pricing]
+[AI Agent: Pricing Calculator]
+  Tools: Code Interpreter, Web Search (current prices)
     ↓
-[Code: Format Quote Data]
+[Code: Apply Business Rules & Minimums]
     ↓
-[HTTP Request: OpenAI - Generate Quote]
+[AI Agent: Professional Quote Generator]
+  Tools: None (pure generation)
     ↓
 [Code: Validate Quote Quality]
     ↓
-[IF/ELSE: High Value (>€5,000)?]
-    ├─ YES → [Wait For: Human Approval]
-    │         ↓
-    └─ NO  → Auto-approve
-              ↓
-[Gmail: Send Quote to Customer]
+[Switch: Quote Value Category]
+    ├─ High (>€5k) → [Wait: Human Approval]
+    ├─ Medium      → [AI Agent: Quality Check]
+    └─ Low         → Auto-approve
+                      ↓
+[Gmail / Send Email: Deliver Quote]
     ↓
-[Database: Save Quote Record]
+[Postgres / Supabase: Save Quote Record]
+    ↓
+[Slack: Notify Sales Team]
     ↓
 END
 ```
 
 ### n8n Workflow State Management
 
-Use **n8n Set Node** to store state throughout workflow:
+Use **Edit Fields (Set)** nodes to manage state throughout workflow:
 
 ```json
 {
-  "rfp_id": "string",
+  "rfp_id": "LT-{{ $now.format('yyyyMMdd-HHmmss') }}",
   "customer_name": "string",
+  "customer_email": "string",
   "project_description": "string",
   "material_type": "steel|aluminum|galvanized|other",
   "dimensions": {
@@ -119,120 +133,173 @@ Use **n8n Set Node** to store state throughout workflow:
 
 ---
 
-## 3. Detailed n8n Workflow Components
+## 3. Detailed n8n Workflow Components with AI Agent Nodes
 
-### Step 1: File Upload & Input Validation
+### Node 1: RFP Document Submission
 
-**Node Type**: Manual Trigger or Webhook Trigger
+**Node Type**: `n8n Form Trigger` or `Webhook`
 
-**Configuration**:
-- Allow file upload (PDF, PNG, JPEG)
-- Extract filename and file data
-- Pass to next node
+**Configuration** (if using n8n Form):
+- **Form Fields**:
+  - Company Name (text, required)
+  - Contact Email (email, required)
+  - Project Description (textarea)
+  - RFP Document Upload (file, accept: .pdf, .png, .jpg, .jpeg)
+  - Technical Drawings (file, optional, multiple)
+  - Urgency (dropdown: Standard / Fast / Rush)
 
-**Node Type**: Code
+**Node Type**: `Edit Fields (Set)`
 
-**Code** (JavaScript):
+**Purpose**: Prepare data for AI agents
+
+**Fields to Set**:
 ```javascript
-// Validate file type
-const file = $input.first().json.file;
-const validTypes = ['application/pdf', 'image/png', 'image/jpeg'];
-
-if (!file || !validTypes.includes(file.type)) {
-  throw new Error('Invalid file type. Please upload PDF or image.');
-}
-
-if (file.size > 10 * 1024 * 1024) {
-  throw new Error('File too large. Maximum 10MB.');
-}
-
-return [{
-  file_name: file.name,
-  file_type: file.type,
-  file_size: file.size,
-  file_data: file.data,
-  validation_passed: true
-}];
+rfp_id = LT-{{ $now.format('yyyyMMdd-HHmmss') }}
+customer_name = {{ $json.company_name }}
+customer_email = {{ $json.contact_email }}
+project_description = {{ $json.project_description }}
+urgency = {{ $json.urgency }}
+has_drawings = {{ $json.technical_drawings ? true : false }}
+uploaded_files = {{ $json }}
 ```
 
 ---
 
-### Step 2: RFP Requirements Extraction
+### Node 2: AI Agent - RFP Requirements Extractor
 
-**Node Type**: HTTP Request (OpenAI API)
+**Node Type**: `AI Agent` (OpenRouter / OpenAI integration)
 
-**Configuration**:
-- **Method**: POST
-- **URL**: `https://api.openai.com/v1/chat/completions`
-- **Headers**:
-  - `Authorization`: Bearer {{$env.OPENAI_API_KEY}}
-  - `Content-Type`: application/json
+**Model Selection**: 
+- Via OpenRouter: `anthropic/claude-3.5-sonnet` or `openai/gpt-4o`
+- Direct OpenAI: `gpt-4o`
 
-**Body** (use expression):
-```javascript
-{
-  "model": "gpt-4o",
-  "messages": [
-    {
-      "role": "system",
-      "content": `You are an expert RFP analyst for Linjateras Oy, a powder coating company in Finland.
-      
-Extract key requirements from the customer's RFP document to enable accurate powder coating quote generation.
+**System Prompt**:
+```
+You are an expert RFP analyst for Linjateras Oy, a powder coating company in Finland.
+
+YOUR TASK:
+Extract all key requirements from the customer's RFP document to enable accurate powder coating quote generation.
 
 EXTRACTION REQUIREMENTS:
-1. Customer Information: Company name, Contact person, Project reference
-2. Project Description: Type of parts, Quantity, Application
-3. Material Specifications: Base material, Current condition
-4. Coating Requirements: Coating type, Color, Finish, Special requirements
-5. Dimensional Information: Maximum dimensions, Number of parts
-6. Timeline Requirements: Desired delivery, Urgency
-7. Special Services: Disassembly/assembly, Surface prep, Handling
+1. Customer Information:
+   - Company name
+   - Contact person  
+   - Project reference number
+   - Email address
 
-OUTPUT FORMAT (JSON):
+2. Project Description:
+   - Type of parts (structural steel, aluminum profiles, equipment, etc.)
+   - Quantity of parts to be coated
+   - Intended application (indoor/outdoor, industry type)
+
+3. Material Specifications:
+   - Base material (steel, aluminum, galvanized steel, other)
+   - Current condition (new, rusted, painted, galvanized)
+
+4. Coating Requirements:
+   - Desired coating type (epoxy, polyester, polyurethane, special)
+   - Color requirements (RAL codes, custom colors, number of colors)
+   - Finish preference (glossy, semi-gloss, matte, supermatt, textured)
+   - Special requirements (UV resistant, chemical resistant, heat resistant, food-safe, anti-bacterial)
+
+5. Dimensional Information:
+   - Maximum dimensions mentioned in text (width, height, length in mm)
+   - Number of parts
+   - Whether technical drawings are included
+
+6. Timeline Requirements:
+   - Desired delivery timeframe
+   - Is this urgent/rush?
+
+7. Special Services:
+   - Need for disassembly/assembly
+   - Need for surface preparation (sandblasting, rust removal)
+   - Special handling requirements
+
+CRITICAL VALIDATIONS:
+- Flag if customer requests "wet painting" or "liquid painting" (Linjateras ONLY does powder coating)
+- Flag if material type is unclear or unusual (we primarily coat steel, aluminum, galvanized steel)
+- Flag if no dimensional information is provided
+- Set confidence score based on completeness of information (0.0-1.0)
+
+OUTPUT FORMAT:
+Return a JSON object with this exact structure:
+
 {
-  "customer_info": {"company": "...", "contact": "...", "reference": "..."},
-  "project_description": "...",
+  "customer_info": {
+    "company": "string",
+    "contact": "string", 
+    "email": "string",
+    "reference": "string"
+  },
+  "project_description": "string",
   "material_type": "steel|aluminum|galvanized|other",
-  "coating_requirements": {...},
+  "coating_requirements": {
+    "type": "epoxy|polyester|polyurethane|special",
+    "color": "RAL code or custom",
+    "finish": "glossy|semi-gloss|matte|supermatt",
+    "special": []
+  },
   "has_technical_drawings": true/false,
-  "dimensions_from_text": {"width_mm": 0, "height_mm": 0, "length_mm": 0},
+  "dimensions_from_text": {
+    "width_mm": 0,
+    "height_mm": 0,
+    "length_mm": 0
+  },
   "quantity": 0,
   "urgency": "standard|rush|emergency",
+  "special_services": [],
   "confidence": 0.0-1.0,
   "missing_critical_info": [],
   "flags": []
 }
-
-VALIDATION:
-- Flag if material type is unclear
-- Flag if no dimensional information
-- Flag if customer requests wet painting (Linjateras ONLY does powder coating)
-- Set confidence score based on completeness`
-    },
-    {
-      "role": "user",
-      "content": [
-        {
-          "type": "text",
-          "text": "Please extract requirements from this RFP document"
-        },
-        {
-          "type": "image_url",
-          "image_url": {
-            "url": "data:{{$node.FileUpload.json.file_type}};base64,{{$node.FileUpload.json.file_data}}"
-          }
-        }
-      ]
-    }
-  ],
-  "temperature": 0.3
-}
 ```
 
-**Output Parsing**:
-- Parse response.choices[0].message.content
-- Extract JSON from response
-- Save to workflow state
+**Tools to Enable**:
+- ✅ **Code Interpreter** - For parsing data
+- ✅ **File Search** - If multiple documents uploaded
+- ✅ **Vision** (automatic with gpt-4o) - For image/PDF analysis
+
+**Input to Agent**:
+```javascript
+{{ $json.project_description }}
+
+Files attached: {{ $json.uploaded_files }}
+```
+
+**Response Mode**: Text (will output JSON)
+
+---
+
+### Node 3: Parse Agent Response
+
+**Node Type**: `Code`
+
+**Purpose**: Extract JSON from AI agent response
+
+**Code**:
+```javascript
+// Get agent response
+const agent_response = $input.first().json.output;
+
+// Parse JSON from response
+let extracted_data;
+try {
+  // Try parsing directly
+  extracted_data = JSON.parse(agent_response);
+} catch (e) {
+  // Extract JSON from markdown code blocks
+  const json_match = agent_response.match(/```json\n([\s\S]*?)\n```/) || 
+                     agent_response.match(/\{[\s\S]*\}/);
+  if (json_match) {
+    extracted_data = JSON.parse(json_match[1] || json_match[0]);
+  } else {
+    throw new Error('Could not extract JSON from agent response');
+  }
+}
+
+return [extracted_data];
+```
 
 ---
 
